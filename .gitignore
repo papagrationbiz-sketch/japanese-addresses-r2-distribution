@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.dev.vars
+.env
+.env.*
+*.log
+data/
+generated/
+fixtures/real/

@@ -1,0 +1,157 @@
+name: Build and publish address data
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Exact upstream commit SHA (40 lowercase hex characters)
+        required: true
+        default: 521f6130110dabcc8d6d12e89606f0515c217eed
+      version:
+        description: Immutable R2 version id, for example v2026-10
+        required: true
+      activate:
+        description: Switch manifest current after upload
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-address-data-publish
+  cancel-in-progress: false
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: r2-production
+    env:
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+      VERSION: ${{ inputs.version }}
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Validate inputs
+        run: |
+          if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
+          if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
+          if [ '${{ inputs.activate }}' = 'true' ] && [ -z "$PUBLIC_BASE_URL" ]; then echo 'PUBLIC_BASE_URL is required when activate is true' >&2; exit 1; fi
+          if [ -n "$PUBLIC_BASE_URL" ] && { [[ "$PUBLIC_BASE_URL" == */ ]] || ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]]; }; then exit 1; fi
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then exit 1; fi
+          if ! [[ "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]; then echo 'upstream_ref must be a 40-character lowercase commit SHA' >&2; exit 1; fi
+      - name: Checkout upstream without a fork
+        run: |
+          git clone --no-checkout https://github.com/geolonia/japanese-addresses-v2.git upstream
+          git -C upstream fetch --depth=1 origin "$UPSTREAM_REF"
+          git -C upstream checkout --detach FETCH_HEAD
+          actual="$(git -C upstream rev-parse HEAD)"
+          test "$actual" = "$UPSTREAM_REF"
+          echo "UPSTREAM_COMMIT=$actual" >> "$GITHUB_ENV"
+      - name: Generate all address data in an isolated container
+        working-directory: upstream
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --workdir /workspace/upstream \
+            --mount "type=bind,src=$PWD,dst=/workspace/upstream" \
+            --env HOME=/tmp \
+            --env NPM_CONFIG_CACHE=/tmp/npm-cache \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev \
+            node:22-bookworm \
+            bash -ceu 'test "$(id -u)" -ne 0; npm ci; npm run run:all'
+      - name: Validate generated dataset
+        run: npm run dataset:validate -- upstream/out/api > dataset-summary.json
+      - name: Derive source timestamp
+        run: |
+          updated="$(jq -r '.meta.updated' upstream/out/api/ja.json)"
+          if ! [[ "$updated" =~ ^[0-9]+$ ]] || [ "$updated" -le 0 ]; then exit 1; fi
+          echo "SOURCE_UPDATED_AT=$(date -u -d "@$updated" '+%Y-%m-%dT%H:%M:%S.000Z')" >> "$GITHUB_ENV"
+      - name: Read and validate current manifest
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest.json --endpoint-url "$R2_ENDPOINT" --no-progress
+          npm run manifest -- validate manifest.json
+          if jq -e --arg version "$VERSION" '.versions | has($version)' manifest.json >/dev/null; then
+            echo "Version is already registered and immutable" >&2
+            exit 1
+          fi
+      - name: Prepare immutable build marker
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          jq -n --arg version "$VERSION" --arg upstreamCommit "$UPSTREAM_COMMIT" --arg sourceUpdatedAt "$SOURCE_UPDATED_AT" \
+            '{version:$version,upstreamCommit:$upstreamCommit,sourceUpdatedAt:$sourceUpdatedAt}' > build-metadata.json
+          existing="$(aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "$VERSION/" --max-items 1 --query 'Contents[0].Key' --output text --endpoint-url "$R2_ENDPOINT")"
+          if [ "$existing" != 'None' ]; then
+            aws s3 cp "s3://$R2_BUCKET/$VERSION/_build.json" existing-build.json --endpoint-url "$R2_ENDPOINT" --no-progress
+            jq -e --arg version "$VERSION" --arg upstreamCommit "$UPSTREAM_COMMIT" --arg sourceUpdatedAt "$SOURCE_UPDATED_AT" \
+              '.version == $version and .upstreamCommit == $upstreamCommit and .sourceUpdatedAt == $sourceUpdatedAt' existing-build.json >/dev/null
+          else
+            aws s3 cp build-metadata.json "s3://$R2_BUCKET/$VERSION/_build.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-store --no-progress
+          fi
+      - name: Upload immutable version prefix
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 sync upstream/out/api "s3://$R2_BUCKET/$VERSION/api/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --cache-control 'public,max-age=31536000,immutable' \
+            --size-only --no-progress
+          aws s3api head-object --bucket "$R2_BUCKET" --key "$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+      - name: Register version and optionally activate
+        id: publish
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-register-check.json --endpoint-url "$R2_ENDPOINT" --no-progress
+          if ! cmp --silent manifest.json manifest-before-register-check.json; then
+            echo 'concurrent manifest update; refusing read-modify-write' >&2
+            exit 1
+          fi
+          cp manifest.json manifest-before-switch.json
+          npm run manifest -- register manifest.json "$VERSION" "$VERSION" "$SOURCE_UPDATED_AT" --coverage national
+          if [ '${{ inputs.activate }}' = 'true' ]; then npm run manifest -- switch manifest.json "$VERSION"; fi
+          npm run manifest -- validate manifest.json
+          aws s3 cp manifest.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress
+      - name: Verify published R2 manifest and root
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "s3://$R2_BUCKET/manifest.json" published-manifest.json --endpoint-url "$R2_ENDPOINT" --no-progress
+          if [ '${{ inputs.activate }}' = 'true' ]; then jq -e --arg version "$VERSION" '.current == $version and (.versions[$version] != null)' published-manifest.json; else jq -e --arg version "$VERSION" '.versions[$version] != null' published-manifest.json; fi
+          aws s3api head-object --bucket "$R2_BUCKET" --key "$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+      - name: Smoke test public gateway
+        if: inputs.activate
+        run: |
+          curl --fail --silent --show-error "$PUBLIC_BASE_URL/manifest.json" | jq -e --arg version "$VERSION" '.current == $version'
+          curl --fail --silent --show-error "$PUBLIC_BASE_URL/versions/$VERSION/api/ja.json" | jq -e '.meta != null and (.data | length) > 0'
+      - name: Restore previous manifest after activation failure
+        if: failure() && inputs.activate && steps.publish.outcome == 'success'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: aws s3 cp manifest-before-switch.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress

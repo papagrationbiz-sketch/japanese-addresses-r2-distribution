@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "current": "v2026-09-example",
+  "previous": null,
+  "updatedAt": "2026-09-02T00:00:00.000Z",
+  "versions": {
+    "v2026-09-example": {
+      "prefix": "versions/v2026-09-example",
+      "publishedAt": "2026-09-02T00:00:00.000Z",
+      "sourceUpdatedAt": "2026-09-01T00:00:00.000Z",
+      "coverage": {
+        "scope": "municipalities",
+        "municipalities": ["ExamplePrefecture/ExampleMunicipality"]
+      }
+    }
+  }
+}

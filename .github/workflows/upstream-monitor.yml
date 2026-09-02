@@ -1,0 +1,40 @@
+name: Monitor japanese-addresses-v2
+
+on:
+  schedule:
+    - cron: '17 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - id: upstream
+        name: Compare upstream state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run upstream:check
+      - name: Open one update issue
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_COMMIT: ${{ steps.upstream.outputs.current_commit }}
+          CURRENT_DATA_UPDATED_AT: ${{ steps.upstream.outputs.current_data_updated_at }}
+        run: |
+          count="$(gh issue list --state open --search 'japanese-addresses-v2 update detected in:title' --json number --jq length)"
+          if [ "$count" = "0" ]; then
+            gh issue create \
+              --title 'japanese-addresses-v2 update detected' \
+              --body "Upstream changed. Commit: \`$CURRENT_COMMIT\`. Public data timestamp: \`$CURRENT_DATA_UPDATED_AT\`. Review the exact ref before running the publish workflow."
+          fi

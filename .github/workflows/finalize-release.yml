@@ -1,0 +1,94 @@
+name: Finalize address data release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_current:
+        description: Current version to finalize (for example v2026-10)
+        required: true
+      confirmation:
+        description: Type DELETE_RETIRED after downstream acceptance checks
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-address-data-publish
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: r2-production
+    env:
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+      EXPECTED_CURRENT: ${{ inputs.expected_current }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Validate finalize inputs
+        run: |
+          if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
+          if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
+          if ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || [[ "$PUBLIC_BASE_URL" == */ ]]; then exit 1; fi
+          if ! [[ "$EXPECTED_CURRENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then exit 1; fi
+          if [ "$CONFIRMATION" != 'DELETE_RETIRED' ]; then echo 'confirmation must be DELETE_RETIRED' >&2; exit 1; fi
+      - name: Read and validate manifest
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-finalize.json --endpoint-url "$R2_ENDPOINT" --no-progress
+          npm run manifest -- validate manifest-before-finalize.json
+          current="$(jq -r '.current' manifest-before-finalize.json)"
+          test "$current" = "$EXPECTED_CURRENT"
+      - name: Smoke test public gateway after downstream acceptance checks
+        run: |
+          curl --fail --silent --show-error "$PUBLIC_BASE_URL/manifest.json" | jq -e --arg expected "$EXPECTED_CURRENT" '.current == $expected'
+          curl --fail --silent --show-error "$PUBLIC_BASE_URL/versions/$EXPECTED_CURRENT/api/ja.json" | jq -e '.meta != null and (.data | length) > 0'
+      - name: Prune manifest and remove only registered retired prefixes
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-prune-check.json --endpoint-url "$R2_ENDPOINT" --no-progress
+          if ! cmp --silent manifest-before-finalize.json manifest-before-prune-check.json; then
+            echo 'concurrent manifest update; refusing prune and delete' >&2
+            exit 1
+          fi
+          npm run manifest -- validate manifest-before-finalize.json
+          current="$(jq -r '.current' manifest-before-finalize.json)"
+          test "$current" = "$EXPECTED_CURRENT"
+          current_prefix="$(jq -r '.versions[.current].prefix' manifest-before-finalize.json)"
+          if ! [[ "$current_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-]?$ ]] || [[ "$current_prefix" == *..* ]] || [[ "$current_prefix" == *//* ]]; then
+            echo 'Unsafe current prefix' >&2
+            exit 1
+          fi
+          jq -r --arg current "$current" '.versions | to_entries[] | select(.key != $current) | .value.prefix' manifest-before-finalize.json > retired-prefixes.txt
+          if [ ! -s retired-prefixes.txt ]; then
+            echo 'No registered retired prefixes; nothing to delete'
+            exit 0
+          fi
+          while IFS= read -r prefix; do
+            if ! [[ "$prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-]?$ ]] || [[ "$prefix" == *..* ]] || [[ "$prefix" == *//* ]] || [ "$prefix" = "$current_prefix" ] || [[ "$prefix" == "$current_prefix/"* ]] || [[ "$current_prefix" == "$prefix/"* ]]; then
+              echo 'Unsafe or overlapping retired prefix' >&2
+              exit 1
+            fi
+          done < retired-prefixes.txt
+          npm run manifest -- prune manifest-before-finalize.json
+          npm run manifest -- validate manifest-before-finalize.json
+          aws s3 cp manifest-before-finalize.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress
+          while IFS= read -r prefix; do
+            aws s3 rm "s3://$R2_BUCKET/$prefix/" --recursive --endpoint-url "$R2_ENDPOINT" --no-progress
+          done < retired-prefixes.txt
