@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit",
     "types": "wrangler types",
     "manifest": "tsx scripts/manifest.mts",
+    "inventory": "tsx scripts/inventory.mts",
+    "smoke": "tsx scripts/smoke-public.mts",
     "upstream:check": "tsx scripts/check-upstream.mts",
     "dataset:validate": "tsx scripts/validate-dataset.mts"
   },

@@ -18,6 +18,56 @@ const safeComponent = (value: string): boolean =>
   !value.includes('\0') &&
   [...value].every((character) => character.charCodeAt(0) >= 0x20)
 
+const expectedPrefectures = new Set([
+  '北海道',
+  '青森県',
+  '岩手県',
+  '宮城県',
+  '秋田県',
+  '山形県',
+  '福島県',
+  '茨城県',
+  '栃木県',
+  '群馬県',
+  '埼玉県',
+  '千葉県',
+  '東京都',
+  '神奈川県',
+  '新潟県',
+  '富山県',
+  '石川県',
+  '福井県',
+  '山梨県',
+  '長野県',
+  '岐阜県',
+  '静岡県',
+  '愛知県',
+  '三重県',
+  '滋賀県',
+  '京都府',
+  '大阪府',
+  '兵庫県',
+  '奈良県',
+  '和歌山県',
+  '鳥取県',
+  '島根県',
+  '岡山県',
+  '広島県',
+  '山口県',
+  '徳島県',
+  '香川県',
+  '愛媛県',
+  '高知県',
+  '福岡県',
+  '佐賀県',
+  '長崎県',
+  '熊本県',
+  '大分県',
+  '宮崎県',
+  '鹿児島県',
+  '沖縄県',
+])
+
 async function readJson(path: string): Promise<JsonRecord | null> {
   try {
     const value: unknown = JSON.parse(await readFile(path, 'utf8'))
@@ -57,6 +107,9 @@ for (const rawPrefecture of prefectures) {
     fail(`unsafe prefecture name: ${rawPrefecture.pref}`)
     continue
   }
+  if (!expectedPrefectures.has(rawPrefecture.pref)) {
+    fail(`unexpected prefecture: ${rawPrefecture.pref}`)
+  }
   if (seenPrefectures.has(rawPrefecture.pref)) fail(`duplicate prefecture: ${rawPrefecture.pref}`)
   seenPrefectures.add(rawPrefecture.pref)
 
@@ -83,17 +136,41 @@ for (const rawPrefecture of prefectures) {
     const cityPath = join(root, 'ja', rawPrefecture.pref, `${city}.json`)
     const cityJson = await readJson(cityPath)
     if (!cityJson) continue
-    if (record(cityJson.meta) && updated !== undefined && cityJson.meta.updated !== updated) {
+    if (
+      !record(cityJson.meta) ||
+      !Number.isSafeInteger(cityJson.meta.updated) ||
+      Number(cityJson.meta.updated) <= 0
+    ) {
+      fail(`${cityPath}: invalid or missing meta.updated`)
+    } else if (updated !== undefined && cityJson.meta.updated !== updated) {
       fail(`${cityPath}: meta.updated mismatch`)
+    }
+    if (!Array.isArray(cityJson.data)) {
+      fail(`${cityPath}: data must be an array`)
+      continue
     }
     const towns = Array.isArray(cityJson.data) ? cityJson.data : []
     townCount += towns.length
 
     for (const rawTown of towns) {
-      if (!record(rawTown) || !record(rawTown.csv_ranges)) continue
+      if (!record(rawTown)) {
+        fail(`${cityPath}: malformed town entry`)
+        continue
+      }
+      if (rawTown.csv_ranges === undefined || rawTown.csv_ranges === null) {
+        continue
+      }
+      if (!record(rawTown.csv_ranges)) {
+        fail(`${cityPath}: town csv_ranges is malformed`)
+        continue
+      }
       for (const kind of ['住居表示', '地番'] as const) {
         const rawRange = rawTown.csv_ranges[kind]
-        if (!record(rawRange)) continue
+        if (rawRange === undefined || rawRange === null) continue
+        if (!record(rawRange)) {
+          fail(`${cityPath}: malformed ${kind} range`)
+          continue
+        }
         const start = rawRange.start
         const length = rawRange.length
         if (
@@ -133,6 +210,11 @@ for (const rawPrefecture of prefectures) {
 if (municipalityCount === 0) fail('dataset has no municipalities')
 if (rangeCount === 0) fail('dataset has no address ranges')
 if (checkedFiles.size === 0) fail('dataset has no text shard files')
+if (seenPrefectures.size !== expectedPrefectures.size) {
+  for (const prefecture of expectedPrefectures) {
+    if (!seenPrefectures.has(prefecture)) fail(`missing prefecture: ${prefecture}`)
+  }
+}
 
 const result = {
   valid: errors.length === 0,

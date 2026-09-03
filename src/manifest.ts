@@ -1,9 +1,18 @@
 export const MANIFEST_KEY = 'manifest.json'
 
+export type DataIntegrity = {
+  algorithm: 'sha256'
+  inventoryPath: string
+  inventorySha256: string
+  fileCount: number
+  totalBytes: number
+}
+
 export type DataVersion = {
   prefix: string
   publishedAt: string
   sourceUpdatedAt?: string
+  integrity?: DataIntegrity
   coverage?:
     | { scope: 'national' }
     | { scope: 'municipalities'; municipalities: string[] }
@@ -19,6 +28,8 @@ export type DataManifest = {
 
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const PREFIX = /^[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-])?$/
+const INVENTORY_PATH = /^[A-Za-z0-9_-](?:[A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-])?$/
+const SHA256 = /^[0-9a-f]{64}$/
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -56,6 +67,53 @@ const assertPrefix = (value: unknown, field: string): string => {
     throw new Error(`${field} is not a safe R2 prefix`)
   }
   return value
+}
+
+const assertInventoryPath = (value: unknown, field: string): string => {
+  if (
+    typeof value !== 'string' ||
+    value.length > 512 ||
+    !INVENTORY_PATH.test(value) ||
+    value.includes('..') ||
+    value.includes('//') ||
+    value.includes('\\') ||
+    value.startsWith('/') ||
+    value.endsWith('/')
+  ) {
+    throw new Error(`${field} is not a safe inventory path`)
+  }
+  return value
+}
+
+const parseIntegrity = (value: unknown, field: string): DataIntegrity => {
+  if (!isRecord(value) || value.algorithm !== 'sha256') {
+    throw new Error(`${field}.algorithm must be sha256`)
+  }
+  const inventoryPath = assertInventoryPath(value.inventoryPath, `${field}.inventoryPath`)
+  if (typeof value.inventorySha256 !== 'string' || !SHA256.test(value.inventorySha256)) {
+    throw new Error(`${field}.inventorySha256 must be lowercase SHA-256`)
+  }
+  if (
+    typeof value.fileCount !== 'number' ||
+    !Number.isSafeInteger(value.fileCount) ||
+    value.fileCount <= 0
+  ) {
+    throw new Error(`${field}.fileCount must be a positive safe integer`)
+  }
+  if (
+    typeof value.totalBytes !== 'number' ||
+    !Number.isSafeInteger(value.totalBytes) ||
+    value.totalBytes < 0
+  ) {
+    throw new Error(`${field}.totalBytes must be a non-negative safe integer`)
+  }
+  return {
+    algorithm: 'sha256',
+    inventoryPath,
+    inventorySha256: value.inventorySha256,
+    fileCount: value.fileCount,
+    totalBytes: value.totalBytes,
+  }
 }
 
 const parseCoverage = (value: unknown, field: string): DataVersion['coverage'] => {
@@ -112,6 +170,9 @@ export function parseManifest(value: unknown): DataManifest {
     if (rawVersion.coverage !== undefined) {
       version.coverage = parseCoverage(rawVersion.coverage, `versions.${id}.coverage`)
     }
+    if (rawVersion.integrity !== undefined) {
+      version.integrity = parseIntegrity(rawVersion.integrity, `versions.${id}.integrity`)
+    }
     versions[id] = version
   }
 
@@ -154,7 +215,11 @@ export function switchVersion(
   now = new Date(),
 ): DataManifest {
   assertVersionId(target, 'target')
-  if (!manifest.versions[target]) throw new Error(`target version is not registered: ${target}`)
+  const targetVersion = manifest.versions[target]
+  if (!targetVersion) throw new Error(`target version is not registered: ${target}`)
+  if (targetVersion.coverage?.scope === 'national' && !targetVersion.integrity) {
+    throw new Error('national target version requires integrity metadata')
+  }
   if (target === manifest.current) return manifest
   return {
     ...manifest,
@@ -171,12 +236,18 @@ export function registerVersion(
   now = new Date(),
 ): DataManifest {
   assertVersionId(id, 'version')
+  const existing = manifest.versions[id]
+  if (!existing && version.prefix !== `versions/${id}`) {
+    throw new Error('new versions must use prefix versions/{id}')
+  }
   const validated = parseManifest({
     ...manifest,
     updatedAt: now.toISOString(),
     versions: { ...manifest.versions, [id]: version },
   })
-  const existing = manifest.versions[id]
+  if (version.coverage?.scope === 'national' && !version.integrity) {
+    throw new Error('national version registration requires integrity metadata')
+  }
   if (existing && JSON.stringify(existing) !== JSON.stringify(validated.versions[id])) {
     throw new Error(`version is already registered with different metadata: ${id}`)
   }
@@ -185,6 +256,10 @@ export function registerVersion(
 
 export function rollbackVersion(manifest: DataManifest, now = new Date()): DataManifest {
   if (!manifest.previous) throw new Error('manifest has no previous version')
+  const target = manifest.versions[manifest.previous]
+  if (target?.coverage?.scope === 'national' && !target.integrity) {
+    throw new Error('national rollback target requires integrity metadata')
+  }
   return {
     ...manifest,
     current: manifest.previous,
@@ -194,16 +269,68 @@ export function rollbackVersion(manifest: DataManifest, now = new Date()): DataM
 }
 
 export function pruneRetiredVersions(manifest: DataManifest, now = new Date()): DataManifest {
+  return pruneOlderVersions(manifest, now)
+}
+
+/** Keep current and previous metadata; remove only versions older than previous. */
+export function pruneOlderVersions(manifest: DataManifest, now = new Date()): DataManifest {
+  if (!manifest.previous) return { ...manifest, updatedAt: now.toISOString() }
+  const retained = new Set([manifest.current, manifest.previous])
   return {
     ...manifest,
-    previous: null,
     updatedAt: now.toISOString(),
-    versions: { [manifest.current]: manifest.versions[manifest.current] },
+    versions: Object.fromEntries(
+      Object.entries(manifest.versions).filter(([id]) => retained.has(id)),
+    ),
   }
+}
+
+/** Return only safe prefixes that are older than the current rollback anchor. */
+export function retiredVersionPrefixes(manifest: DataManifest): string[] {
+  if (!manifest.previous) return []
+  const anchorIDs = [manifest.current, manifest.previous]
+  const anchorPrefixes = anchorIDs.map((id) => {
+    const prefix = manifest.versions[id]?.prefix
+    if (!prefix || !safePrefix(prefix)) {
+      throw new Error('manifest contains an unsafe current or previous version prefix')
+    }
+    return prefix
+  })
+  const retired: string[] = []
+  return Object.entries(manifest.versions)
+    .filter(([id]) => id !== manifest.current && id !== manifest.previous)
+    .map(([id, version]) => {
+      if (!VERSION_ID.test(id) || !safePrefix(version.prefix)) {
+        throw new Error('manifest contains an unsafe retired version prefix')
+      }
+      if (anchorPrefixes.some((anchor) => prefixesOverlap(anchor, version.prefix))) {
+        throw new Error('manifest contains a retired prefix overlapping current or previous')
+      }
+      if (retired.some((prefix) => prefixesOverlap(prefix, version.prefix))) {
+        throw new Error('manifest contains overlapping retired version prefixes')
+      }
+      retired.push(version.prefix)
+      return version.prefix
+    })
+    .sort()
 }
 
 export function versionPrefix(manifest: DataManifest, version = manifest.current): string {
   const entry = manifest.versions[version]
   if (!entry) throw new Error(`version is not registered: ${version}`)
   return entry.prefix
+}
+
+function safePrefix(value: string): boolean {
+  return (
+    value.length <= 512 &&
+    PREFIX.test(value) &&
+    !value.includes('..') &&
+    !value.includes('//') &&
+    !value.includes('\\')
+  )
+}
+
+function prefixesOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
 }

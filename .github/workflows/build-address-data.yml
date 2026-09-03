@@ -46,7 +46,7 @@ jobs:
           if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
           if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
           if [ '${{ inputs.activate }}' = 'true' ] && [ -z "$PUBLIC_BASE_URL" ]; then echo 'PUBLIC_BASE_URL is required when activate is true' >&2; exit 1; fi
-          if [ -n "$PUBLIC_BASE_URL" ] && { [[ "$PUBLIC_BASE_URL" == */ ]] || ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]]; }; then exit 1; fi
+          if [ -n "$PUBLIC_BASE_URL" ] && ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then exit 1; fi
           if ! [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then exit 1; fi
           if ! [[ "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]; then echo 'upstream_ref must be a 40-character lowercase commit SHA' >&2; exit 1; fi
       - name: Checkout upstream without a fork
@@ -78,6 +78,12 @@ jobs:
           updated="$(jq -r '.meta.updated' upstream/out/api/ja.json)"
           if ! [[ "$updated" =~ ^[0-9]+$ ]] || [ "$updated" -le 0 ]; then exit 1; fi
           echo "SOURCE_UPDATED_AT=$(date -u -d "@$updated" '+%Y-%m-%dT%H:%M:%S.000Z')" >> "$GITHUB_ENV"
+      - name: Generate deterministic SHA-256 inventory
+        run: |
+          npm run inventory -- generate upstream/out inventory.json _integrity/sha256.json
+          echo "INVENTORY_SHA256=$(sha256sum inventory.json | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+          echo "INVENTORY_FILE_COUNT=$(jq -r '.fileCount' inventory.json)" >> "$GITHUB_ENV"
+          echo "INVENTORY_TOTAL_BYTES=$(jq -r '.totalBytes' inventory.json)" >> "$GITHUB_ENV"
       - name: Read and validate current manifest
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -97,14 +103,16 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           jq -n --arg version "$VERSION" --arg upstreamCommit "$UPSTREAM_COMMIT" --arg sourceUpdatedAt "$SOURCE_UPDATED_AT" \
-            '{version:$version,upstreamCommit:$upstreamCommit,sourceUpdatedAt:$sourceUpdatedAt}' > build-metadata.json
-          existing="$(aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "$VERSION/" --max-items 1 --query 'Contents[0].Key' --output text --endpoint-url "$R2_ENDPOINT")"
+            --arg inventorySha256 "$INVENTORY_SHA256" --argjson fileCount "$INVENTORY_FILE_COUNT" --argjson totalBytes "$INVENTORY_TOTAL_BYTES" \
+            '{version:$version,upstreamCommit:$upstreamCommit,sourceUpdatedAt:$sourceUpdatedAt,inventorySha256:$inventorySha256,fileCount:$fileCount,totalBytes:$totalBytes}' > build-metadata.json
+          existing="$(aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "versions/$VERSION/" --max-items 1 --query 'Contents[0].Key' --output text --endpoint-url "$R2_ENDPOINT")"
           if [ "$existing" != 'None' ]; then
-            aws s3 cp "s3://$R2_BUCKET/$VERSION/_build.json" existing-build.json --endpoint-url "$R2_ENDPOINT" --no-progress
+            aws s3 cp "s3://$R2_BUCKET/versions/$VERSION/_build.json" existing-build.json --endpoint-url "$R2_ENDPOINT" --no-progress
             jq -e --arg version "$VERSION" --arg upstreamCommit "$UPSTREAM_COMMIT" --arg sourceUpdatedAt "$SOURCE_UPDATED_AT" \
-              '.version == $version and .upstreamCommit == $upstreamCommit and .sourceUpdatedAt == $sourceUpdatedAt' existing-build.json >/dev/null
+              --arg inventorySha256 "$INVENTORY_SHA256" --argjson fileCount "$INVENTORY_FILE_COUNT" --argjson totalBytes "$INVENTORY_TOTAL_BYTES" \
+              '.version == $version and .upstreamCommit == $upstreamCommit and .sourceUpdatedAt == $sourceUpdatedAt and .inventorySha256 == $inventorySha256 and .fileCount == $fileCount and .totalBytes == $totalBytes' existing-build.json >/dev/null
           else
-            aws s3 cp build-metadata.json "s3://$R2_BUCKET/$VERSION/_build.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-store --no-progress
+            aws s3 cp build-metadata.json "s3://$R2_BUCKET/versions/$VERSION/_build.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-store --no-progress
           fi
       - name: Upload immutable version prefix
         env:
@@ -112,11 +120,35 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          aws s3 sync upstream/out/api "s3://$R2_BUCKET/$VERSION/api/" \
+          aws s3 cp upstream/out/api "s3://$R2_BUCKET/versions/$VERSION/api/" \
+            --recursive \
             --endpoint-url "$R2_ENDPOINT" \
             --cache-control 'public,max-age=31536000,immutable' \
-            --size-only --no-progress
-          aws s3api head-object --bucket "$R2_BUCKET" --key "$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+            --no-progress
+          aws s3 cp inventory.json "s3://$R2_BUCKET/versions/$VERSION/_integrity/sha256.json" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/json \
+            --cache-control 'public,max-age=31536000,immutable' --no-progress
+          aws s3api head-object --bucket "$R2_BUCKET" --key "versions/$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+      - name: Download and verify the complete uploaded version
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          rm -rf upstream/out/api
+          available_bytes="$(df -Pk "${RUNNER_TEMP:-.}" | awk 'NR==2 {print $4 * 1024}')"
+          required_bytes=$((INVENTORY_TOTAL_BYTES + 1073741824))
+          if ! [[ "$available_bytes" =~ ^[0-9]+$ ]] || [ "$available_bytes" -lt "$required_bytes" ]; then
+            echo "insufficient temporary disk: require at least ${required_bytes} bytes" >&2
+            exit 1
+          fi
+          verify_root="$(mktemp -d)"
+          trap 'rm -rf "$verify_root"' EXIT
+          mkdir -p "$verify_root/api" "$verify_root/_integrity"
+          aws s3 cp "s3://$R2_BUCKET/versions/$VERSION/api/" "$verify_root/api/" --recursive --endpoint-url "$R2_ENDPOINT" --no-progress
+          aws s3 cp "s3://$R2_BUCKET/versions/$VERSION/_integrity/sha256.json" "$verify_root/_integrity/sha256.json" --endpoint-url "$R2_ENDPOINT" --no-progress
+          npm run inventory -- verify "$verify_root" "$verify_root/_integrity/sha256.json" _integrity/sha256.json
+          echo 'INTEGRITY_VERIFIED=true' >> "$GITHUB_ENV"
       - name: Register version and optionally activate
         id: publish
         env:
@@ -124,13 +156,24 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
+          if [ '${{ inputs.activate }}' = 'true' ]; then
+            switch_inventory="$(mktemp)"
+            trap 'rm -f "$switch_inventory"' EXIT
+            aws s3 cp "s3://$R2_BUCKET/versions/$VERSION/_integrity/sha256.json" "$switch_inventory" --endpoint-url "$R2_ENDPOINT" --no-progress
+            test "$(sha256sum "$switch_inventory" | cut -d ' ' -f 1)" = "$INVENTORY_SHA256"
+            test "$(jq -r '.fileCount' "$switch_inventory")" = "$INVENTORY_FILE_COUNT"
+            test "$(jq -r '.totalBytes' "$switch_inventory")" = "$INVENTORY_TOTAL_BYTES"
+            test "$INTEGRITY_VERIFIED" = true
+          fi
           aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-register-check.json --endpoint-url "$R2_ENDPOINT" --no-progress
           if ! cmp --silent manifest.json manifest-before-register-check.json; then
             echo 'concurrent manifest update; refusing read-modify-write' >&2
             exit 1
           fi
           cp manifest.json manifest-before-switch.json
-          npm run manifest -- register manifest.json "$VERSION" "$VERSION" "$SOURCE_UPDATED_AT" --coverage national
+          npm run manifest -- register manifest.json "$VERSION" "versions/$VERSION" "$SOURCE_UPDATED_AT" --coverage national \
+            --integrity-path _integrity/sha256.json --integrity-sha256 "$INVENTORY_SHA256" \
+            --integrity-file-count "$INVENTORY_FILE_COUNT" --integrity-total-bytes "$INVENTORY_TOTAL_BYTES"
           if [ '${{ inputs.activate }}' = 'true' ]; then npm run manifest -- switch manifest.json "$VERSION"; fi
           npm run manifest -- validate manifest.json
           aws s3 cp manifest.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress
@@ -142,12 +185,12 @@ jobs:
         run: |
           aws s3 cp "s3://$R2_BUCKET/manifest.json" published-manifest.json --endpoint-url "$R2_ENDPOINT" --no-progress
           if [ '${{ inputs.activate }}' = 'true' ]; then jq -e --arg version "$VERSION" '.current == $version and (.versions[$version] != null)' published-manifest.json; else jq -e --arg version "$VERSION" '.versions[$version] != null' published-manifest.json; fi
-          aws s3api head-object --bucket "$R2_BUCKET" --key "$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+          aws s3api head-object --bucket "$R2_BUCKET" --key "versions/$VERSION/api/ja.json" --endpoint-url "$R2_ENDPOINT"
+          aws s3api head-object --bucket "$R2_BUCKET" --key "versions/$VERSION/_integrity/sha256.json" --endpoint-url "$R2_ENDPOINT"
       - name: Smoke test public gateway
         if: inputs.activate
         run: |
-          curl --fail --silent --show-error "$PUBLIC_BASE_URL/manifest.json" | jq -e --arg version "$VERSION" '.current == $version'
-          curl --fail --silent --show-error "$PUBLIC_BASE_URL/versions/$VERSION/api/ja.json" | jq -e '.meta != null and (.data | length) > 0'
+          npm run smoke -- "$PUBLIC_BASE_URL" "$VERSION"
       - name: Restore previous manifest after activation failure
         if: failure() && inputs.activate && steps.publish.outcome == 'success'
         env:

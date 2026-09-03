@@ -62,6 +62,14 @@ test('register accepts explicit national coverage', async () => {
     '2026-09-03T00:00:00.000Z',
     '--coverage',
     'national',
+    '--integrity-path',
+    '_integrity/sha256.json',
+    '--integrity-sha256',
+    'a'.repeat(64),
+    '--integrity-file-count',
+    '1',
+    '--integrity-total-bytes',
+    '1',
   )
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as DataManifest
   assert.deepEqual(manifest.versions.v2.coverage, { scope: 'national' })
@@ -111,8 +119,8 @@ test('switch, rollback, and prune update the manifest file', async () => {
   assert.equal(manifest.current, 'v1')
   await runCli('prune', manifestPath)
   manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as DataManifest
-  assert.deepEqual(Object.keys(manifest.versions), ['v1'])
-  assert.equal(manifest.previous, null)
+  assert.deepEqual(Object.keys(manifest.versions), ['v1', 'v2'])
+  assert.equal(manifest.previous, 'v2')
 })
 
 test('register rejects unknown and duplicate coverage options', async () => {
@@ -137,4 +145,48 @@ test('register rejects unknown and duplicate coverage options', async () => {
     '--coverage',
     'national',
   )
+})
+
+test('register rejects national coverage without integrity metadata', async () => {
+  const { manifestPath } = await setup()
+  await runCliFailure(
+    'register',
+    manifestPath,
+    'v2',
+    'versions/v2',
+    '2026-09-03T00:00:00.000Z',
+    '--coverage',
+    'national',
+  )
+})
+
+test('retired-prefixes writes only versions older than previous', async () => {
+  const { directory } = await setup()
+  const manifestPath = join(directory, 'three-versions.json')
+  const outputPath = join(directory, 'retired-prefixes.txt')
+  await writeFile(
+    manifestPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      current: 'v3',
+      previous: 'v2',
+      updatedAt: '2026-09-02T00:00:00.000Z',
+      versions: {
+        v1: { prefix: 'versions/v1', publishedAt: '2026-08-01T00:00:00.000Z' },
+        v2: { prefix: 'versions/v2', publishedAt: '2026-08-02T00:00:00.000Z' },
+        v3: { prefix: 'versions/v3', publishedAt: '2026-08-03T00:00:00.000Z' },
+      },
+    }),
+    'utf8',
+  )
+  await runCli('retired-prefixes', manifestPath, outputPath)
+  assert.equal(await readFile(outputPath, 'utf8'), 'versions/v1\n')
+  assert.equal((await readFile(manifestPath, 'utf8')).includes('v3'), true)
+})
+
+test('retired-prefixes writes an empty file when previous is null', async () => {
+  const { directory, manifestPath } = await setup()
+  const outputPath = join(directory, 'retired-prefixes.txt')
+  await runCli('retired-prefixes', manifestPath, outputPath)
+  assert.equal(await readFile(outputPath, 'utf8'), '')
 })

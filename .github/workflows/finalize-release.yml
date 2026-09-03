@@ -7,7 +7,7 @@ on:
         description: Current version to finalize (for example v2026-10)
         required: true
       confirmation:
-        description: Type DELETE_RETIRED after downstream acceptance checks
+        description: Type DELETE_OLDER_THAN_PREVIOUS after downstream acceptance checks
         required: true
 
 permissions:
@@ -39,9 +39,9 @@ jobs:
         run: |
           if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
           if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
-          if ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]] || [[ "$PUBLIC_BASE_URL" == */ ]]; then exit 1; fi
+          if ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then exit 1; fi
           if ! [[ "$EXPECTED_CURRENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then exit 1; fi
-          if [ "$CONFIRMATION" != 'DELETE_RETIRED' ]; then echo 'confirmation must be DELETE_RETIRED' >&2; exit 1; fi
+          if [ "$CONFIRMATION" != 'DELETE_OLDER_THAN_PREVIOUS' ]; then echo 'confirmation must be DELETE_OLDER_THAN_PREVIOUS' >&2; exit 1; fi
       - name: Read and validate manifest
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -54,8 +54,7 @@ jobs:
           test "$current" = "$EXPECTED_CURRENT"
       - name: Smoke test public gateway after downstream acceptance checks
         run: |
-          curl --fail --silent --show-error "$PUBLIC_BASE_URL/manifest.json" | jq -e --arg expected "$EXPECTED_CURRENT" '.current == $expected'
-          curl --fail --silent --show-error "$PUBLIC_BASE_URL/versions/$EXPECTED_CURRENT/api/ja.json" | jq -e '.meta != null and (.data | length) > 0'
+          npm run smoke -- "$PUBLIC_BASE_URL" "$EXPECTED_CURRENT"
       - name: Prune manifest and remove only registered retired prefixes
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -70,22 +69,11 @@ jobs:
           npm run manifest -- validate manifest-before-finalize.json
           current="$(jq -r '.current' manifest-before-finalize.json)"
           test "$current" = "$EXPECTED_CURRENT"
-          current_prefix="$(jq -r '.versions[.current].prefix' manifest-before-finalize.json)"
-          if ! [[ "$current_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-]?$ ]] || [[ "$current_prefix" == *..* ]] || [[ "$current_prefix" == *//* ]]; then
-            echo 'Unsafe current prefix' >&2
-            exit 1
-          fi
-          jq -r --arg current "$current" '.versions | to_entries[] | select(.key != $current) | .value.prefix' manifest-before-finalize.json > retired-prefixes.txt
+          npm run manifest -- retired-prefixes manifest-before-finalize.json retired-prefixes.txt
           if [ ! -s retired-prefixes.txt ]; then
-            echo 'No registered retired prefixes; nothing to delete'
+            echo 'No versions older than previous; nothing to delete'
             exit 0
           fi
-          while IFS= read -r prefix; do
-            if ! [[ "$prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9._-]?$ ]] || [[ "$prefix" == *..* ]] || [[ "$prefix" == *//* ]] || [ "$prefix" = "$current_prefix" ] || [[ "$prefix" == "$current_prefix/"* ]] || [[ "$current_prefix" == "$prefix/"* ]]; then
-              echo 'Unsafe or overlapping retired prefix' >&2
-              exit 1
-            fi
-          done < retired-prefixes.txt
           npm run manifest -- prune manifest-before-finalize.json
           npm run manifest -- validate manifest-before-finalize.json
           aws s3 cp manifest-before-finalize.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress

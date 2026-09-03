@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,21 +7,26 @@ import {
   MANIFEST_KEY,
   parseManifest,
   pruneRetiredVersions,
+  retiredVersionPrefixes,
   registerVersion,
   rollbackVersion,
   switchVersion,
   versionPrefix,
+  type DataIntegrity,
   type DataManifest,
   type DataVersion,
 } from '../src/manifest'
 
 const usage = `Usage:
   npm run manifest -- validate <manifest-file>
-  npm run manifest -- register <manifest-file> <version> <prefix> <source-updated-at> [--coverage national]
-  npm run manifest -- register <manifest-file> <version> <prefix> <source-updated-at> [--coverage municipalities --municipalities-file <file>]
+  npm run manifest -- register <manifest-file> <version> <prefix> <source-updated-at> [options]
+  options: --coverage national|municipalities --municipalities-file <file>
+           --integrity-path <path> --integrity-sha256 <hex64>
+           --integrity-file-count <positive-int> --integrity-total-bytes <nonnegative-int>
   npm run manifest -- switch <manifest-file> <version>
   npm run manifest -- rollback <manifest-file>
   npm run manifest -- prune <manifest-file>
+  npm run manifest -- retired-prefixes <manifest-file> [output-file]
   npm run manifest -- remote-switch <bucket> <version>
   npm run manifest -- remote-rollback <bucket>`
 
@@ -72,12 +78,44 @@ async function remoteUpdate(
   validateBucket(bucket)
   const directory = await mkdtemp(join(tmpdir(), 'japanese-addresses-manifest-'))
   const manifestPath = join(directory, MANIFEST_KEY)
+  const latestManifestPath = join(directory, 'manifest-latest.json')
   const probePath = join(directory, 'ja.json')
+  const inventoryPath = join(directory, 'inventory.json')
   try {
     download(bucket, MANIFEST_KEY, manifestPath)
     const next = update(await readManifest(manifestPath))
-    // Verify the target exists before changing the public pointer.
+    // Verify the target and, when declared, its integrity inventory before changing the pointer.
+    const target = next.versions[next.current]
+    if (target.coverage?.scope === 'national' && !target.integrity) {
+      throw new Error('national target version requires integrity metadata')
+    }
     download(bucket, `${versionPrefix(next)}/api/ja.json`, probePath)
+    if (target.integrity) {
+      download(bucket, `${versionPrefix(next)}/${target.integrity.inventoryPath}`, inventoryPath)
+      const inventoryBytes = await readFile(inventoryPath)
+      const inventory = JSON.parse(inventoryBytes.toString('utf8')) as {
+        fileCount?: unknown
+        totalBytes?: unknown
+      }
+      const inventorySha256 = createHash('sha256').update(inventoryBytes).digest('hex')
+      if (inventorySha256 !== target.integrity.inventorySha256) {
+        throw new Error('target inventory SHA-256 does not match manifest')
+      }
+      if (inventory.fileCount !== target.integrity.fileCount) {
+        throw new Error('target inventory file count does not match manifest')
+      }
+      if (inventory.totalBytes !== target.integrity.totalBytes) {
+        throw new Error('target inventory total bytes does not match manifest')
+      }
+    }
+    download(bucket, MANIFEST_KEY, latestManifestPath)
+    const [before, latest] = await Promise.all([
+      readFile(manifestPath),
+      readFile(latestManifestPath),
+    ])
+    if (!before.equals(latest)) {
+      throw new Error('concurrent manifest update; refusing remote update')
+    }
     await writeManifest(manifestPath, next)
     uploadManifest(bucket, manifestPath)
     return next
@@ -98,7 +136,16 @@ function validateOptions(options: string[]): void {
   const seen = new Set<string>()
   for (let index = 0; index < options.length; index += 1) {
     const name = options[index]
-    if (name !== '--coverage' && name !== '--municipalities-file') {
+    if (
+      ![
+        '--coverage',
+        '--municipalities-file',
+        '--integrity-path',
+        '--integrity-sha256',
+        '--integrity-file-count',
+        '--integrity-total-bytes',
+      ].includes(name)
+    ) {
       throw new Error(`unknown option: ${name}`)
     }
     if (seen.has(name)) throw new Error(`duplicate option: ${name}`)
@@ -138,18 +185,49 @@ async function parseCoverage(options: string[]): Promise<DataVersion['coverage']
   return { scope: 'municipalities', municipalities: municipalities as string[] }
 }
 
+function parseIntegrity(options: string[]): DataIntegrity | undefined {
+  const path = optionValue(options, '--integrity-path')
+  const sha256 = optionValue(options, '--integrity-sha256')
+  const fileCount = optionValue(options, '--integrity-file-count')
+  const totalBytes = optionValue(options, '--integrity-total-bytes')
+  const values = [path, sha256, fileCount, totalBytes]
+  if (values.every((value) => value === undefined)) return undefined
+  if (values.some((value) => value === undefined)) {
+    throw new Error('all integrity options are required together')
+  }
+  if (!/^[0-9a-f]{64}$/.test(sha256!)) throw new Error('integrity SHA-256 must be lowercase hex')
+  const count = Number(fileCount)
+  const bytes = Number(totalBytes)
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    throw new Error('integrity file count must be a positive safe integer')
+  }
+  if (!Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new Error('integrity total bytes must be a non-negative safe integer')
+  }
+  return {
+    algorithm: 'sha256',
+    inventoryPath: path!,
+    inventorySha256: sha256!,
+    fileCount: count,
+    totalBytes: bytes,
+  }
+}
+
 const args = process.argv.slice(2)
 const [command, first, second, third, fourth] = args
 if (!command || !first) throw new Error(usage)
 
 let result: DataManifest
+let retiredPrefixesOutput: string[] | undefined
 switch (command) {
   case 'validate':
     result = await readManifest(first)
     break
   case 'register': {
     if (!second || !third || !fourth) throw new Error(usage)
-    const coverage = await parseCoverage(args.slice(5))
+    const options = args.slice(5)
+    const coverage = await parseCoverage(options)
+    const integrity = parseIntegrity(options)
     result = registerVersion(
       await readManifest(first),
       second,
@@ -158,6 +236,7 @@ switch (command) {
         publishedAt: new Date().toISOString(),
         sourceUpdatedAt: fourth,
         ...(coverage ? { coverage } : {}),
+        ...(integrity ? { integrity } : {}),
       },
     )
     await writeManifest(first, result)
@@ -176,6 +255,14 @@ switch (command) {
     result = pruneRetiredVersions(await readManifest(first))
     await writeManifest(first, result)
     break
+  case 'retired-prefixes': {
+    const manifest = await readManifest(first)
+    retiredPrefixesOutput = retiredVersionPrefixes(manifest)
+    if (second) {
+      await writeFile(second, `${retiredPrefixesOutput.join('\n')}${retiredPrefixesOutput.length ? '\n' : ''}`)
+    }
+    break
+  }
   case 'remote-switch':
     if (!second) throw new Error(usage)
     result = await remoteUpdate(first, (manifest) => switchVersion(manifest, second))
@@ -187,4 +274,8 @@ switch (command) {
     throw new Error(usage)
 }
 
-console.log(JSON.stringify({ current: result.current, previous: result.previous, updatedAt: result.updatedAt }))
+if (retiredPrefixesOutput) {
+  if (!second) console.log(retiredPrefixesOutput.join('\n'))
+} else {
+  console.log(JSON.stringify({ current: result.current, previous: result.previous, updatedAt: result.updatedAt }))
+}
