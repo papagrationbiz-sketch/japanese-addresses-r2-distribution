@@ -11,8 +11,8 @@
 `build-address-data.yml` は `workflow_dispatch` でのみ起動する。GitHub Environment `r2-production` の承認ルールを設定してから利用する。
 
 1. レビュー済みのupstream exact commit（40桁lowercase SHA）を`upstream_ref`へ指定し、upstreamをforkせずcloneしてdetach checkoutする。fetch後のHEADが入力SHAと完全一致することを検証する。
-2. upstream directoryだけをbind mountした非root `node:22-bookworm`コンテナ内で`npm ci && npm run run:all`を実行する。root checkout、root `node_modules`、credentialsはコンテナへmountせず、R2 Secretsも渡さない。
-3. `scripts/validate-dataset.mts`で47都道府県、自治体、町字range、object size整合性を確認する。
+2. upstream directoryとrunnerの専用一時directoryだけをbind mountした非root `node:22-bookworm`コンテナ内で依存解決と生成を実行する。`run:01_make_prefecture_city`で全国rootを一度作った後、47都道府県コードを1つずつ`SETTINGS_JSON`の`lgCodes`へ渡して`run:02_make_machi_aza`・`run:03_make_rsdt`・`run:04_make_chiban`を順次実行する。各都道府県はfreshな一時出力directoryへ生成し、stageが成功した場合だけ対象都道府県のJSONまたは`*-住居表示.txt`・`*-地番.txt`を最終`out/api`へ反映するため、失敗途中や前回prefixの部分出力を混在させない。全47都道府県が成功してから`SETTINGS_JSON`をunsetし（後段へprefix filterを漏らさないisolation/future-proof invariant）、全国対象の`run:10_refresh_csv_ranges`と`run:99_create_stats`を実行する。`run:03_make_rsdt`と`run:04_make_chiban`だけが、`terminated`、`UND_ERR_SOCKET`、`ECONNRESET`、`ETIMEDOUT`など観測済みのbody/network一時エラーを最大3回再試行し、`SQLITE_FULL`や入力不整合など他の失敗は即時停止する。attempt開始前と失敗直後に結合用SQLite一時directoryを削除するが、attempt間は`CACHE_DIR`のdownload cacheを再利用する。生成後はroot `ja.json`のcanonical `meta.updated`を自治体JSONの生成メタデータへ反映し、upstreamの独立実行時刻差だけを解消する。step終了時の`EXIT` trapで専用一時directory（cacheを含む）をcleanupする。root checkout、root `node_modules`、credentialsはコンテナへmountせず、R2 Secretsも渡さない。
+3. `scripts/validate-dataset.mts`で47都道府県、自治体、町字range、object size整合性を確認する。upstreamが町字行なしとして自治体JSONを省略する場合は、対応する住居表示・地番shardも存在しないときだけ許容し、shardが残る自治体JSON欠落は失敗にする。
 4. validator成功後、`scripts/inventory.mts`で`api/...`全regular fileのdeterministic SHA-256 inventoryを生成し、指定version prefixへimmutable uploadする。
 5. clean temporary directoryへ全version dataとinventoryをdownloadし、inventoryのfile count・total bytes・各hashを再検証する。失敗時はmanifestを変更しない。
 6. manifestへregisterする。全量検証済みのこのworkflowだけが`--coverage national`を明示する。
@@ -34,6 +34,8 @@ buildのsmokeまたは公開検証が失敗した場合、旧manifestを復元�
 
 - 公開repositoryのGitHub Environment `r2-production`にrequired reviewerを設定し、承認前はR2 Secretsをjobへ渡さない。
 - 標準`ubuntu-latest` runnerは14 GB SSDのため、生成後の`inventory.totalBytes`に1 GiBを加えた空き容量を、元データ削除後・再download前にworkflowが検査する。満たさなければmanifestを変更せず停止する。
+- 全国の住居表示・地番結合は数GiBの一時SQLiteを作るため、コンテナの`TMPDIR`をrunner diskへbind mountする。`/tmp` tmpfsだけで生成すると`SQLITE_FULL`になるため使用しない。
+- 実測の全国出力は約5.44 GiB、download cacheは約3.41 GiB、最大都道府県出力は約317 MiBだった。cacheと生成一時領域はvalidator/inventory前にstep終了時のtrapで削除する。標準runnerでは47回の順次生成により360分timeoutが残余リスクであり、初回runで各prefix所要時間を記録する。
 - job timeoutは360分。生成時間、upload時間、全量再download時間は初回runで別々に記録し、timeoutへ近づく場合はlarger/self-hosted runnerを別途承認する。
 - R2権限は対象bucketのList/Get/Put/Deleteに限定する。Deleteは`finalize-release.yml`だけが、current/previous以外の検証済みprefixへ使用する。
 - Custom Domainを同じCloudflare accountのzoneへ接続する。`r2.dev`は本番経路にしない。

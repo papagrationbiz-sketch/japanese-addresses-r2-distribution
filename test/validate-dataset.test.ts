@@ -117,6 +117,63 @@ test('accepts a complete synthetic national dataset', async () => {
   }
 })
 
+test('accepts municipality timestamps generated independently from ja.json', async () => {
+  const root = await fixture()
+  try {
+    for (const pref of prefectures) {
+      const cityPath = join(root, 'ja', pref, 'SyntheticCity.json')
+      const city = JSON.parse(await readFile(cityPath, 'utf8')) as { meta: { updated: number } }
+      city.meta.updated += 1
+      await writeFile(cityPath, JSON.stringify(city), 'utf8')
+    }
+    const result = await run(root)
+    assert.equal(result.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects inconsistent municipality timestamps', async () => {
+  const root = await fixture()
+  try {
+    const cityPath = join(root, 'ja', prefectures[0], 'SyntheticCity.json')
+    const city = JSON.parse(await readFile(cityPath, 'utf8')) as { meta: { updated: number } }
+    city.meta.updated += 1
+    await writeFile(cityPath, JSON.stringify(city), 'utf8')
+    const result = await run(root)
+    assert.equal(result.ok, false)
+    assert.match(result.output, /municipality meta\.updated mismatch/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('accepts an upstream municipality with no town data', async () => {
+  const root = await fixture()
+  try {
+    const directory = join(root, 'ja', prefectures[0])
+    await rm(join(directory, 'SyntheticCity.json'))
+    await rm(join(directory, 'SyntheticCity-住居表示.txt'))
+    await rm(join(directory, 'SyntheticCity-地番.txt'))
+    const result = await run(root)
+    assert.equal(result.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejects a missing municipality when address shards exist', async () => {
+  const root = await fixture()
+  try {
+    await rm(join(root, 'ja', prefectures[0], 'SyntheticCity.json'))
+    const result = await run(root)
+    assert.equal(result.ok, false)
+    assert.match(result.output, /SyntheticCity\.json: missing/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('accepts a town without optional csv_ranges', async () => {
   const root = await fixture()
   try {

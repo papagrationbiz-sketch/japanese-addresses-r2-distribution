@@ -60,17 +60,163 @@ jobs:
       - name: Generate all address data in an isolated container
         working-directory: upstream
         run: |
+          build_tmp="$RUNNER_TEMP/japanese-addresses-v2-tmp"
+          trap 'rm -rf "$build_tmp"; if [ -n "${city_files:-}" ]; then rm -f "$city_files"; fi' EXIT
+          mkdir -p "$build_tmp"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --workdir /workspace/upstream \
             --mount "type=bind,src=$PWD,dst=/workspace/upstream" \
-            --env HOME=/tmp \
-            --env NPM_CONFIG_CACHE=/tmp/npm-cache \
+            --mount "type=bind,src=$build_tmp,dst=/work-tmp" \
+            --env TMPDIR=/work-tmp \
+            --env CACHE_DIR=/work-tmp/cache \
+            --env NPM_CONFIG_CACHE=/work-tmp/npm-cache \
             --cap-drop=ALL \
             --security-opt=no-new-privileges \
             --tmpfs /tmp:rw,nosuid,nodev \
             node:22-bookworm \
-            bash -ceu 'test "$(id -u)" -ne 0; npm ci; npm run run:all'
+            bash -ceu '
+              set -o pipefail
+              test "$(id -u)" -ne 0
+              final_out=/workspace/upstream/out/api
+              rm -rf "$final_out"
+              npm ci
+              npm run run:01_make_prefecture_city -- "$final_out"
+
+              copy_stage_files() {
+                stage_out="$1"
+                file_suffix="$2"
+                pref_name="$3"
+                first_file="$(find "$stage_out/ja/$pref_name" -type f -name "*-$file_suffix.txt" -print -quit)"
+                if [ -z "$first_file" ]; then
+                  echo "stage produced no $pref_name/*-$file_suffix.txt files" >&2
+                  return 1
+                fi
+                find "$final_out/ja/$pref_name" -type f -name "*-$file_suffix.txt" -delete
+                find "$stage_out/ja/$pref_name" -type f -name "*-$file_suffix.txt" -print0 |
+                  while IFS= read -r -d "" source_file; do
+                    relative_file="${source_file#"$stage_out/"}"
+                    mkdir -p "$final_out/$(dirname "$relative_file")"
+                    cp -- "$source_file" "$final_out/$relative_file"
+                  done
+              }
+
+              copy_prefecture_json() {
+                stage_out="$1"
+                pref_name="$2"
+                first_file="$(find "$stage_out/ja/$pref_name" -type f -name "*.json" -print -quit)"
+                if [ -z "$first_file" ]; then
+                  echo "stage produced no $pref_name municipality JSON files" >&2
+                  return 1
+                fi
+                rm -rf "$final_out/ja/$pref_name"
+                mkdir -p "$final_out/ja/$pref_name"
+                find "$stage_out/ja/$pref_name" -type f -name "*.json" -print0 |
+                  while IFS= read -r -d "" source_file; do
+                    relative_file="${source_file#"$stage_out/"}"
+                    mkdir -p "$final_out/$(dirname "$relative_file")"
+                    cp -- "$source_file" "$final_out/$relative_file"
+                  done
+              }
+
+              run_data_stage() {
+                script="$1"
+                file_suffix="$2"
+                pref_code="$3"
+                pref_name="$4"
+                attempt=1
+                while :; do
+                  attempt_out="/work-tmp/${pref_code}-${file_suffix}-attempt-${attempt}"
+                  log="/work-tmp/${pref_code}-${file_suffix}-attempt-${attempt}.log"
+                  rm -rf /work-tmp/merge-data-left-join-*
+                  rm -rf "$attempt_out"
+                  mkdir -p "$attempt_out"
+                  echo "Running $script for $pref_name (attempt $attempt/3)"
+                  if npm run "$script" -- "$attempt_out" 2>&1 | tee "$log"; then
+                    copy_stage_files "$attempt_out" "$file_suffix" "$pref_name"
+                    rm -rf "$attempt_out" "$log"
+                    return 0
+                  fi
+                  status="${PIPESTATUS[0]}"
+                  if [ "$status" -eq 0 ]; then
+                    status=1
+                  fi
+                  rm -rf /work-tmp/merge-data-left-join-*
+                  if grep -Eiq "SQLITE_FULL|input (is )?inconsistent|inconsistent input" "$log"; then
+                    echo "$script failed with a non-retryable storage/input error" >&2
+                    return "$status"
+                  fi
+                  if ! grep -Eiq "terminated|UND_ERR_SOCKET|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|socket hang up|fetch failed|premature close|connection (reset|closed|timed out)|body.*(timeout|reset|closed)" "$log"; then
+                    echo "$script failed with a non-retryable error" >&2
+                    return "$status"
+                  fi
+                  if [ "$attempt" -ge 3 ]; then
+                    echo "$script failed after $attempt transient-error attempts" >&2
+                    return "$status"
+                  fi
+                  echo "$script failed with a transient body/network error; retrying with a fresh output directory" >&2
+                  rm -rf "$attempt_out"
+                  sleep "$((attempt * 10))"
+                  attempt="$((attempt + 1))"
+                done
+              }
+
+              for pref_spec in \
+                "01:北海道" "02:青森県" "03:岩手県" "04:宮城県" "05:秋田県" "06:山形県" "07:福島県" \
+                "08:茨城県" "09:栃木県" "10:群馬県" "11:埼玉県" "12:千葉県" "13:東京都" "14:神奈川県" \
+                "15:新潟県" "16:富山県" "17:石川県" "18:福井県" "19:山梨県" "20:長野県" "21:岐阜県" \
+                "22:静岡県" "23:愛知県" "24:三重県" "25:滋賀県" "26:京都府" "27:大阪府" "28:兵庫県" \
+                "29:奈良県" "30:和歌山県" "31:鳥取県" "32:島根県" "33:岡山県" "34:広島県" "35:山口県" \
+                "36:徳島県" "37:香川県" "38:愛媛県" "39:高知県" "40:福岡県" "41:佐賀県" "42:長崎県" \
+                "43:熊本県" "44:大分県" "45:宮崎県" "46:鹿児島県" "47:沖縄県"; do
+                pref_code="${pref_spec%%:*}"
+                pref_name="${pref_spec#*:}"
+                settings_json="{\"lgCodes\":[\"^${pref_code}\"]}"
+                export SETTINGS_JSON="$settings_json"
+                prefix_out="/work-tmp/${pref_code}-machi-aza"
+                rm -rf /work-tmp/merge-data-left-join-* "$prefix_out"
+                mkdir -p "$prefix_out"
+                echo "Generating $pref_name ($pref_code)"
+                if npm run run:02_make_machi_aza -- "$prefix_out"; then
+                  copy_prefecture_json "$prefix_out" "$pref_name"
+                else
+                  status="$?"
+                  rm -rf /work-tmp/merge-data-left-join-* "$prefix_out"
+                  echo "run:02_make_machi_aza failed for $pref_name" >&2
+                  exit "$status"
+                fi
+                rm -rf /work-tmp/merge-data-left-join-* "$prefix_out"
+                run_data_stage run:03_make_rsdt 住居表示 "$pref_code" "$pref_name"
+                run_data_stage run:04_make_chiban 地番 "$pref_code" "$pref_name"
+              done
+              rm -rf /work-tmp/merge-data-left-join-*
+              unset SETTINGS_JSON
+              npm run run:10_refresh_csv_ranges -- "$final_out"
+              npm run run:99_create_stats -- "$final_out"
+            '
+          canonical_updated="$(jq -r '.meta.updated' out/api/ja.json)"
+          if ! [[ "$canonical_updated" =~ ^[0-9]+$ ]] || [ "$canonical_updated" -le 0 ]; then
+            echo 'ja.json meta.updated is invalid' >&2
+            exit 1
+          fi
+          city_files="$(mktemp)"
+          if ! find out/api/ja -mindepth 2 -maxdepth 2 -type f -name '*.json' -print0 > "$city_files"; then
+            echo 'failed to enumerate municipality JSON files' >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' city_file; do
+            tmp_file="${city_file}.tmp"
+            if ! jq --argjson updated "$canonical_updated" '.meta.updated = $updated' "$city_file" > "$tmp_file"; then
+              rm -f "$tmp_file"
+              echo "failed to normalize metadata: $city_file" >&2
+              exit 1
+            fi
+            if ! mv -- "$tmp_file" "$city_file"; then
+              echo "failed to replace metadata: $city_file" >&2
+              exit 1
+            fi
+          done < "$city_files"
+          rm -f "$city_files"
       - name: Validate generated dataset
         run: npm run dataset:validate -- upstream/out/api > dataset-summary.json
       - name: Derive source timestamp

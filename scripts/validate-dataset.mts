@@ -79,6 +79,15 @@ async function readJson(path: string): Promise<JsonRecord | null> {
   }
 }
 
+async function regularFileExists(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile()
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
 const rootJson = await readJson(join(root, 'ja.json'))
 if (!rootJson) throw new Error(JSON.stringify({ valid: false, errors }))
 
@@ -96,6 +105,7 @@ let municipalityCount = 0
 let townCount = 0
 let rangeCount = 0
 let rangeBytes = 0
+let municipalityUpdated: number | undefined
 const checkedFiles = new Map<string, number>()
 
 for (const rawPrefecture of prefectures) {
@@ -134,6 +144,15 @@ for (const rawPrefecture of prefectures) {
     municipalityCount += 1
 
     const cityPath = join(root, 'ja', rawPrefecture.pref, `${city}.json`)
+    if (!(await regularFileExists(cityPath))) {
+      // upstream run:02 omits municipalities with no町字 rows; run:99 explicitly skips them.
+      const addressShards = await Promise.all([
+        regularFileExists(join(root, 'ja', rawPrefecture.pref, `${city}-住居表示.txt`)),
+        regularFileExists(join(root, 'ja', rawPrefecture.pref, `${city}-地番.txt`)),
+      ])
+      if (addressShards.some(Boolean)) fail(`${cityPath}: missing`)
+      continue
+    }
     const cityJson = await readJson(cityPath)
     if (!cityJson) continue
     if (
@@ -142,8 +161,10 @@ for (const rawPrefecture of prefectures) {
       Number(cityJson.meta.updated) <= 0
     ) {
       fail(`${cityPath}: invalid or missing meta.updated`)
-    } else if (updated !== undefined && cityJson.meta.updated !== updated) {
-      fail(`${cityPath}: meta.updated mismatch`)
+    } else if (municipalityUpdated === undefined) {
+      municipalityUpdated = Number(cityJson.meta.updated)
+    } else if (cityJson.meta.updated !== municipalityUpdated) {
+      fail(`${cityPath}: municipality meta.updated mismatch`)
     }
     if (!Array.isArray(cityJson.data)) {
       fail(`${cityPath}: data must be an array`)
