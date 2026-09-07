@@ -59,6 +59,63 @@ GitHub Secrets（値はworkflowへ直書きしない）:
 
 R2のendpoint、bucket、公開URL、認証値はこのリポジトリへ書かない。R2 access keyはmanifest read/write、対象prefix upload、検証済みretired prefix deleteだけの最小権限にする。workflow inputのversion/refは正規表現で検証し、AWS/Git/curlにはquote済み文字列で渡す。upstream clone、生成、validatorのstepにはR2 Secretsを渡さない。
 
+## ABR配信元の地域制限と実行環境
+
+ABRの配信CDN `data.address-br.digital.go.jp` は日本国外からのアクセスを `403` で拒否する。
+upstream自身がソース（`src/lib/hub.test.ts`、`src/test_helpers/fixture_cache.ts`）に
+この事実を記載しており、upstreamは既にUser-Agentを `curl/8.7.1` にしている。
+つまりUser-Agentやリトライの調整では回避できない。
+
+実測（2026-09-07、`abr-reachability.yml` の run `34071693433` と同一URLへのローカル実行）:
+
+- GitHub-hosted runner（egress `US`）… 検索API `dataset.address-br` は `200`、配信CDNは
+  upstreamのUser-Agentでもブラウザ相当のUser-Agentでも `403`
+- 日本国内ネットワーク … 同一URL・同一User-Agentで `206`、検索APIは `200`
+
+検索APIだけ国外から到達できるため、失敗は検索stepではなく最初のCDNダウンロードで表面化する。
+`upstream-monitor.yml` はupstreamのgit commitを比較するだけなので影響を受けない。
+
+`build-address-data.yml` は生成前に配信CDNへの到達性を確認し、届かない場合は数十秒で停止する。
+到達性だけを単独で確認したい場合は `abr-reachability.yml` を実行する。どちらも `runner` inputで
+実行環境を指定できるため、self-hosted runnerを用意してもworkflowの書き換えは不要。
+
+### self-hosted runnerの前提
+
+- 日本国内から通信すること。これが唯一の必須条件。
+- Dockerが必要。生成stepは `node:22-bookworm` コンテナで実行する。macOSのrunnerには
+  Dockerが標準で入らないため、Docker Desktopまたはcolimaを別途用意する。
+- 一時領域に十分な空きが必要。実測で住居表示の結合SQLiteが約19.4GiB、生成物が約5.2GiB、
+  upstreamキャッシュが約3.4GiBに達する。100GB以上を見込む。
+- 公開リポジトリでのself-hosted runnerはGitHubが注意を促している構成である。生成workflowは
+  `workflow_dispatch` 限定かつEnvironment承認必須だが、runnerは1ジョブで破棄するエフェメラル
+  運用にし、外部コラボレーターのworkflow実行に承認を要求する設定を併用する。
+
+## ローカル生成からの公開手順
+
+GitHub-hosted runnerで生成できない間は、日本国内の作業機で生成し、検証済みの出力を直接R2へ
+投入する。これは実際に全国版 `v2026-09-national-521f613` を公開した手順である。
+
+1. upstreamをexact commitでcloneし、`run:01` から `run:99` までを順に実行する。各stageは
+   使い捨てコンテナで動かし、`TMPDIR` はtmpfsではなくディスク上に置く。
+2. `npm run dataset:validate -- <out>/api` が `valid:true` で終了することを確認する。
+3. `npm run inventory -- generate <out> inventory.json _integrity/sha256.json` を実行する。
+   同じ出力から2回生成してSHA-256が一致することを確認し、決定性を担保する。
+4. 対象bucketのObject Read & Writeだけに限定したR2 API tokenを作成する。アカウント全体に
+   届く既存の認証情報は使わない。設定は専用ファイルへ分離し、対象外bucketと`ListBuckets`が
+   `403` になることを実際に確認してから書き込みを始める。
+5. `_build.json`（`no-store`）、`api/`（`public,max-age=31536000,immutable`）、
+   `_integrity/sha256.json`（immutable）の順に投入する。`sourceUpdatedAt` は
+   `api/ja.json` の `meta.updated` から導出し、workflowと同じ契約に揃える。
+6. version prefix全体を別ディレクトリへ再downloadし、`npm run inventory -- verify` を通す。
+7. manifestを取得して直前の内容と一致することを確認してから `manifest register` を行い、
+   `manifest validate` の後に `no-cache` で書き戻す。activateはここでは行わない。
+8. `npm run smoke` と固定URL/Range/キャッシュヘッダを確認し、必要なら `manifest switch` で
+   activateする。rollbackと再activateもmanifestの書き換えだけで完了する。
+9. 公開後に `npm run accuracy -- <公開base URL> <version>` を実行し、精度証跡を残す。
+
+rcloneを使う場合、bucket限定tokenでは `HeadBucket` が拒否されるため `--s3-no-check-bucket`
+が必要になる。これを付けないとrcloneが `CreateBucket` を試みて `403` で失敗する。
+
 ## M6受入証跡
 
 外部runごとに、秘密情報や住所本文を含めず次を保存する。

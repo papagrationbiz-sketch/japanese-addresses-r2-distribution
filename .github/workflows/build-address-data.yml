@@ -15,6 +15,12 @@ on:
         required: true
         type: boolean
         default: false
+      runner:
+        description: >-
+          Runner label. ABRの配信CDNは日本国外を403で拒否するため、生成には日本国内の
+          self-hosted runnerが必要になる。GitHub-hosted runnerは日本に配置されない。
+        type: string
+        default: ubuntu-latest
 
 permissions:
   contents: read
@@ -25,7 +31,7 @@ concurrency:
 
 jobs:
   build-publish:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     environment: r2-production
     env:
@@ -50,6 +56,23 @@ jobs:
           if [ -n "$PUBLIC_BASE_URL" ] && ! [[ "$PUBLIC_BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then exit 1; fi
           if ! [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then exit 1; fi
           if ! [[ "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]; then echo 'upstream_ref must be a 40-character lowercase commit SHA' >&2; exit 1; fi
+      - name: Require the runner to reach the ABR distribution CDN
+        run: |
+          # ABRの配信CDNは日本国外からのアクセスを403で拒否する。生成は最初の
+          # ダウンロードで必ず失敗するため、数時間分のstepを走らせる前に止める。
+          url='https://data.address-br.digital.go.jp/mt_town/mt_town_all.csv.zip'
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -r 0-0 -A 'curl/8.7.1' "$url" || echo 000)"
+          echo "ABR distribution CDN: HTTP $status"
+          case "$status" in
+            200|206) ;;
+            *)
+              echo "this runner cannot download ABR data (HTTP $status)" >&2
+              echo 'run this workflow on a Japan-based self-hosted runner via the runner input,' >&2
+              echo 'or publish from a verified local generation as described in' >&2
+              echo 'docs/operations/update-workflow.md' >&2
+              exit 1
+              ;;
+          esac
       - name: Checkout upstream without a fork
         run: |
           git clone --no-checkout https://github.com/geolonia/japanese-addresses-v2.git upstream
