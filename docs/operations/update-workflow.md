@@ -72,4 +72,8 @@ R2のendpoint、bucket、公開URL、認証値はこのリポジトリへ書か�
 - cleanup前後のmanifest。current/previousが保持され、削除対象がolderだけであること
 - 全国versionに対する精度suite、latency。Custom Domain直配信ではWorker CPUを使用しないため、CPU証跡はlegacy Workerを残す場合だけ取得する
 
+精度suiteは `npm run accuracy -- <公開base URL> <version> [出力ファイル]` で実行する。公開経路そのものを読むため、配信経路の検証も兼ねる。都道府県ごとに1件を決定的に抽出し（seed固定のFNV-1aで選ぶため再実行しても同一住所）、政令市の区・離島市・島嶼町の固定ケースを加える。各町字の代表点と国土地理院の住所検索結果をhaversine距離で比較し、件数・解決数・min/median/p90/max・500m以内・1km以内・5km超を要約する。
+
+距離の外れ値は必ずしも欠陥ではない。代表点の取り方の差で同一大字内に数百mの差が出ることがあり、国土地理院が島嶼部を`八丈島八丈町`のように郡相当を含む表記で索引しているため、ABR表記のままでは解決しない住所がある。要約だけで判断せず、個別ケースの座標を確認して原因を記録する。
+
 consumer rolloutへの引継ぎは[`consumer-rollout.md`](consumer-rollout.md)を参照する。

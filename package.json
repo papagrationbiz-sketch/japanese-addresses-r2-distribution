@@ -12,6 +12,7 @@
     "manifest": "tsx scripts/manifest.mts",
     "inventory": "tsx scripts/inventory.mts",
     "smoke": "tsx scripts/smoke-public.mts",
+    "accuracy": "tsx scripts/accuracy-check.mts",
     "upstream:check": "tsx scripts/check-upstream.mts",
     "dataset:validate": "tsx scripts/validate-dataset.mts"
   },

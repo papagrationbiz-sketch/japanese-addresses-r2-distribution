@@ -43,7 +43,7 @@ npm run types
 
 `npm run types` は現在の `wrangler.jsonc` から `worker-configuration.d.ts` を生成する。R2 bucket名は [`wrangler.jsonc`](wrangler.jsonc) の placeholder を、各環境のローカル設定またはCI設定で置き換える。実値、Secrets、住所データはGitへ追加しない。
 
-データ生成と公開は [`build-address-data.yml`](.github/workflows/build-address-data.yml) を手動実行し、更新監視は [`upstream-monitor.yml`](.github/workflows/upstream-monitor.yml) で行う。build後はcurrent+previousを保持する。下流の受入確認後、[`finalize-release.yml`](.github/workflows/finalize-release.yml)を明示確認付きで実行し、previousより古いprefixだけをcleanupする。manifest操作は `npm run manifest`、inventory生成・検証は `npm run inventory`、公開契約の静的確認は `npm run smoke` で実行できる。coverage省略時はunknownであり、nationalとは解釈しない。公開前にはupstreamのexact commitを指定し、生成結果と出典をレビューする。
+データ生成と公開は [`build-address-data.yml`](.github/workflows/build-address-data.yml) を手動実行し、更新監視は [`upstream-monitor.yml`](.github/workflows/upstream-monitor.yml) で行う。build後はcurrent+previousを保持する。下流の受入確認後、[`finalize-release.yml`](.github/workflows/finalize-release.yml)を明示確認付きで実行し、previousより古いprefixだけをcleanupする。manifest操作は `npm run manifest`、inventory生成・検証は `npm run inventory`、公開契約の静的確認は `npm run smoke` で実行できる。公開済みversionの住所精度は `npm run accuracy -- <公開base URL> <version> [出力ファイル]` で確認する。これは公開経路から都道府県ごとに1件（＋構造的な固定ケース）を決定的に抽出し、各町字の代表点を国土地理院の住所検索結果とhaversine距離で比較する。抽出は seed 固定のため再実行しても同じ住所を照合する。coverage省略時はunknownであり、nationalとは解釈しない。公開前にはupstreamのexact commitを指定し、生成結果と出典をレビューする。
 
 smoke確認では公開base URLをhost root（path/query/fragmentなし）で渡し、期待するcurrent versionも指定する。
 
