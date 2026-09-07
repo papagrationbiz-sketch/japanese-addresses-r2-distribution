@@ -47,13 +47,15 @@ Custom Domain、DNS、Cache Rule、CORS、Secrets、全国uploadは外部状態�
 GitHub Environment variables:
 
 - `R2_BUCKET`: R2 bucket名
-- `R2_ENDPOINT`: S3互換R2 endpoint（`https://host`形式）
 - `PUBLIC_BASE_URL`: activate時必須の公開R2 Custom Domain base URL（legacy Data Workerを使う場合はそのURL）
 
 GitHub Secrets（値はworkflowへ直書きしない）:
 
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
+- `R2_ENDPOINT`: S3互換R2 endpoint（`https://host`形式）。endpoint hostはaccount識別子を含むため、variableではなくSecretにする。Actionsは各stepの`env:`ブロックを平文で描画するので、Secretにすることでログ上は自動的にマスクされる。
+
+`R2_BUCKET`、`R2_ENDPOINT`、`PUBLIC_BASE_URL`はjob単位の`env:`へ置かない。R2へ実際にアクセスするstepと入力検証step、smoke testのstepにだけstep単位で渡す。これにより、生成stepなどR2と無関係なstepのログへ本番識別子が描画されない。
 
 R2のendpoint、bucket、公開URL、認証値はこのリポジトリへ書かない。R2 access keyはmanifest read/write、対象prefix upload、検証済みretired prefix deleteだけの最小権限にする。workflow inputのversion/refは正規表現で検証し、AWS/Git/curlにはquote済み文字列で渡す。upstream clone、生成、validatorのstepにはR2 Secretsを渡さない。
 

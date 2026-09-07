@@ -29,9 +29,6 @@ jobs:
     timeout-minutes: 360
     environment: r2-production
     env:
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
-      R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
       VERSION: ${{ inputs.version }}
       UPSTREAM_REF: ${{ inputs.upstream_ref }}
     steps:
@@ -42,6 +39,10 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Validate inputs
+        env:
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
         run: |
           if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
           if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
@@ -235,6 +236,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest.json --endpoint-url "$R2_ENDPOINT" --no-progress
           npm run manifest -- validate manifest.json
@@ -247,6 +250,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           jq -n --arg version "$VERSION" --arg upstreamCommit "$UPSTREAM_COMMIT" --arg sourceUpdatedAt "$SOURCE_UPDATED_AT" \
             --arg inventorySha256 "$INVENTORY_SHA256" --argjson fileCount "$INVENTORY_FILE_COUNT" --argjson totalBytes "$INVENTORY_TOTAL_BYTES" \
@@ -265,6 +270,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           aws s3 cp upstream/out/api "s3://$R2_BUCKET/versions/$VERSION/api/" \
             --recursive \
@@ -280,6 +287,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           rm -rf upstream/out/api
           available_bytes="$(df -Pk "${RUNNER_TEMP:-.}" | awk 'NR==2 {print $4 * 1024}')"
@@ -301,6 +310,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           if [ '${{ inputs.activate }}' = 'true' ]; then
             switch_inventory="$(mktemp)"
@@ -328,6 +339,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           aws s3 cp "s3://$R2_BUCKET/manifest.json" published-manifest.json --endpoint-url "$R2_ENDPOINT" --no-progress
           if [ '${{ inputs.activate }}' = 'true' ]; then jq -e --arg version "$VERSION" '.current == $version and (.versions[$version] != null)' published-manifest.json; else jq -e --arg version "$VERSION" '.versions[$version] != null' published-manifest.json; fi
@@ -335,6 +348,8 @@ jobs:
           aws s3api head-object --bucket "$R2_BUCKET" --key "versions/$VERSION/_integrity/sha256.json" --endpoint-url "$R2_ENDPOINT"
       - name: Smoke test public gateway
         if: inputs.activate
+        env:
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
         run: |
           npm run smoke -- "$PUBLIC_BASE_URL" "$VERSION"
       - name: Restore previous manifest after activation failure
@@ -343,4 +358,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: aws s3 cp manifest-before-switch.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress

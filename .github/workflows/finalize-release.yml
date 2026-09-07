@@ -23,9 +23,6 @@ jobs:
     timeout-minutes: 30
     environment: r2-production
     env:
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
-      R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
-      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
       EXPECTED_CURRENT: ${{ inputs.expected_current }}
       CONFIRMATION: ${{ inputs.confirmation }}
     steps:
@@ -36,6 +33,10 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Validate finalize inputs
+        env:
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
         run: |
           if ! [[ "$R2_BUCKET" =~ ^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$ ]]; then exit 1; fi
           if ! [[ "$R2_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+$ ]]; then exit 1; fi
@@ -47,12 +48,16 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-finalize.json --endpoint-url "$R2_ENDPOINT" --no-progress
           npm run manifest -- validate manifest-before-finalize.json
           current="$(jq -r '.current' manifest-before-finalize.json)"
           test "$current" = "$EXPECTED_CURRENT"
       - name: Smoke test public gateway after downstream acceptance checks
+        env:
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
         run: |
           npm run smoke -- "$PUBLIC_BASE_URL" "$EXPECTED_CURRENT"
       - name: Prune manifest and remove only registered retired prefixes
@@ -60,6 +65,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           aws s3 cp "s3://$R2_BUCKET/manifest.json" manifest-before-prune-check.json --endpoint-url "$R2_ENDPOINT" --no-progress
           if ! cmp --silent manifest-before-finalize.json manifest-before-prune-check.json; then
