@@ -25,6 +25,11 @@ jobs:
     env:
       EXPECTED_CURRENT: ${{ inputs.expected_current }}
       CONFIRMATION: ${{ inputs.confirmation }}
+      # エッジからの排除は実測で数分かかる。伝播待ちの上限と再確認間隔。
+      PURGE_VERIFY_TIMEOUT_SECONDS: '600'
+      PURGE_VERIFY_INTERVAL_SECONDS: '20'
+      # 退役prefix全体へ均等に散らして確認する件数の上限。
+      PURGE_VERIFY_SAMPLE: '100'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -77,13 +82,104 @@ jobs:
           current="$(jq -r '.current' manifest-before-finalize.json)"
           test "$current" = "$EXPECTED_CURRENT"
           npm run manifest -- retired-prefixes manifest-before-finalize.json retired-prefixes.txt
+          : > retired-objects.txt
           if [ ! -s retired-prefixes.txt ]; then
             echo 'No versions older than previous; nothing to delete'
             exit 0
           fi
+          # オブジェクトのkeyは削除前にしか列挙できない。エッジからのパージに必要なので先に控える。
+          while IFS= read -r prefix; do
+            aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "$prefix/" \
+              --endpoint-url "$R2_ENDPOINT" --query 'Contents[].Key' --output text \
+              | tr '\t' '\n' | sed '/^None$/d;/^$/d' >> retired-objects.txt
+          done < retired-prefixes.txt
           npm run manifest -- prune manifest-before-finalize.json
           npm run manifest -- validate manifest-before-finalize.json
           aws s3 cp manifest-before-finalize.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control no-cache --no-progress
           while IFS= read -r prefix; do
             aws s3 rm "s3://$R2_BUCKET/$prefix/" --recursive --endpoint-url "$R2_ENDPOINT" --no-progress
           done < retired-prefixes.txt
+      - name: Purge retired prefixes from the CDN edge
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_PURGE_TOKEN: ${{ secrets.CLOUDFLARE_PURGE_TOKEN }}
+        run: |
+          # 固定versionはimmutableで配信するため、originから消してもエッジのコピーは残る。
+          # 退役prefixを公開経路から読めなくするには、削除後にパージが要る。
+          if [ ! -s retired-objects.txt ]; then
+            echo 'No retired objects; nothing to purge'
+            exit 0
+          fi
+          : > purge-urls.txt
+          while IFS= read -r key; do
+            encoded=""
+            while IFS= read -r segment; do
+              encoded="$encoded/$(printf '%s' "$segment" | jq -sRr @uri)"
+            done <<< "$(printf '%s' "$key" | tr '/' '\n')"
+            printf '%s%s\n' "$PUBLIC_BASE_URL" "$encoded" >> purge-urls.txt
+          done < retired-objects.txt
+          sort -u purge-urls.txt -o purge-urls.txt
+          # Free/Proプランでは1リクエスト30URLまで。prefix指定パージはEnterprise限定で、
+          # 非対応プランでも success:true が返るだけで実行されないため使わない。
+          rm -rf purge-batches && mkdir purge-batches
+          split -l 30 purge-urls.txt purge-batches/batch-
+          for batch in purge-batches/batch-*; do
+            jq -Rn '[inputs | select(length > 0)] | {files: .}' < "$batch" > purge-body.json
+            for attempt in 1 2 3; do
+              status="$(curl -sS -o purge-response.json -w '%{http_code}' \
+                -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
+                -H "Authorization: Bearer $CLOUDFLARE_PURGE_TOKEN" \
+                -H 'Content-Type: application/json' --data @purge-body.json || echo 000)"
+              if [ "$status" = 200 ] && jq -e '.success == true' purge-response.json >/dev/null; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "cache purge failed for $batch (HTTP $status)" >&2
+                jq -r '.errors // empty | tostring' purge-response.json >&2 || true
+                echo 'retired objects were deleted from R2 but remain readable from the edge' >&2
+                exit 1
+              fi
+              sleep $((attempt * 5))
+            done
+          done
+          echo "requested purge of $(wc -l < purge-urls.txt) URLs across $(ls purge-batches | wc -l) batches"
+      - name: Verify retired prefixes are no longer served
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+        run: |
+          # purge_cacheの success:true は要求の受理を意味するだけで、破棄の完了ではない。
+          # 実測では反映に数分かかる。公開経路から実際に消えたことだけを受入条件とする。
+          if [ ! -s purge-urls.txt ]; then
+            echo 'No purged URLs to verify'
+            exit 0
+          fi
+          total="$(wc -l < purge-urls.txt)"
+          # 全国version1件で約4,500 URLになる。毎ラウンド全件を引くと1周だけで数分かかり
+          # 待ち時間の判定が成立しないため、prefix全体へ均等に散らした決定的サンプルで確認する。
+          stride=$(( (total + PURGE_VERIFY_SAMPLE - 1) / PURGE_VERIFY_SAMPLE ))
+          [ "$stride" -lt 1 ] && stride=1
+          awk -v s="$stride" 'NR % s == 1 || s == 1' purge-urls.txt > verify-urls.txt
+          echo "verifying $(wc -l < verify-urls.txt) of $total purged URLs"
+          deadline=$(( $(date +%s) + PURGE_VERIFY_TIMEOUT_SECONDS ))
+          while :; do
+            : > still-served.txt
+            while IFS= read -r url; do
+              status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" || echo 000)"
+              if [ "$status" != 404 ]; then
+                printf '%s %s\n' "$status" "$url" >> still-served.txt
+              fi
+            done < verify-urls.txt
+            if [ ! -s still-served.txt ]; then
+              echo "all $(wc -l < verify-urls.txt) sampled URLs of $total return 404"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "retired objects were deleted from R2 but are still served from the edge:" >&2
+              head -20 still-served.txt >&2
+              echo "$(wc -l < still-served.txt) URL(s) still reachable after ${PURGE_VERIFY_TIMEOUT_SECONDS}s" >&2
+              exit 1
+            fi
+            echo "$(wc -l < still-served.txt) URL(s) still served; waiting for purge to propagate"
+            sleep "$PURGE_VERIFY_INTERVAL_SECONDS"
+          done

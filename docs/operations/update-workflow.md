@@ -51,6 +51,8 @@ GitHub Secrets（値はworkflowへ直書きしない）。Environment variable�
 - `R2_ENDPOINT`: S3互換R2 endpoint（`https://host`形式）
 - `R2_BUCKET`: R2 bucket名
 - `PUBLIC_BASE_URL`: activate時必須の公開R2 Custom Domain base URL（legacy Data Workerを使う場合はそのURL）
+- `CLOUDFLARE_ZONE_ID`: 公開ドメインのzone ID。`finalize-release.yml`のcache purgeで使う
+- `CLOUDFLARE_PURGE_TOKEN`: Zone → Cache Purge → Purge のみを対象zoneに限定して付与したAPI token
 
 Actionsは各stepの`env:`ブロックを平文で描画する。公開リポジトリではrun logを誰でも読めるため、
 本番識別子はすべてSecretにしてマスクさせる。
@@ -64,6 +66,39 @@ Actionsは各stepの`env:`ブロックを平文で描画する。公開リポジ
 だけstep単位で渡す。これにより、生成stepなどR2と無関係なstepへは渡らない。
 
 R2のendpoint、bucket、公開URL、認証値はこのリポジトリへ書かない。R2 access keyはmanifest read/write、対象prefix upload、検証済みretired prefix deleteだけの最小権限にする。workflow inputのversion/refは正規表現で検証し、AWS/Git/curlにはquote済み文字列で渡す。upstream clone、生成、validatorのstepにはR2 Secretsを渡さない。
+
+## 退役versionはoriginの削除だけでは公開経路から消えない
+
+`/versions/*` は `max-age=31536000, immutable` で配信する。R2からオブジェクトを削除しても、
+エッジにあるコピーはそのまま返り続ける。実測では、削除済みprefixが約28.5時間前のキャッシュを
+`cf-cache-status: HIT` で配信し続けた。
+
+`finalize-release.yml` は、削除前に退役prefix配下のオブジェクトkeyを列挙し、R2から削除した後に
+Cloudflare Cache Purge APIへURL指定でパージ要求を送り、**最後に実際にGETして404になることを確認する**。
+
+`purge_cache` の `success:true` は要求の受理を意味するだけで、破棄の完了を保証しない。実測では
+反映まで数分かかり、60秒の観測窓では消えていないように見える。API応答を根拠に完了と report すると
+虚偽になるため、公開経路から実際に消えたことだけを受入条件とする。伝播待ちの上限は
+`PURGE_VERIFY_TIMEOUT_SECONDS`（既定600秒）、再確認間隔は `PURGE_VERIFY_INTERVAL_SECONDS`
+（既定20秒）で調整する。タイムアウトした場合は「R2からは削除済み、エッジからの排除は未完了」と
+明示して失敗する。
+
+パージ要求は退役prefixの全オブジェクトへ送るが、確認は `PURGE_VERIFY_SAMPLE`（既定100件）を上限と
+した決定的サンプルで行う。全国version1件の退役で対象は約4,500 URLになり、毎ラウンド全件を引くと
+1周だけで数分かかって待ち時間の判定が成立しないため。サンプルはprefix全体へ均等に散らし、対象が
+上限以下なら全件を確認する。ログには確認件数と総数の両方を出す。
+
+注意点:
+
+- Free/Proプランは1リクエストあたり30URLまで。workflowは30件ずつ分割して送る。全国version1件の
+  退役では約150リクエストになる。プランごとにURL指定パージの日次上限があるため、大きなversionを
+  続けて退役させる場合は上限に達しないか確認する。
+- prefix指定パージ（`prefixes`）はEnterprise限定。非対応プランでも `success:true` が返るだけで
+  実行されないため使わない。単独で試して効果が無いことを確認済み。
+- 確実性を優先する場合は `Purge Everything` が使えるが、zone全体のキャッシュを消すため、同じzoneの
+  無関係なサイトと配信中データのwarm cacheも失われる。
+- 検証で調べた範囲では、キャッシュキーはカスタム設定なし、Tiered Cacheは無効、Cache ReserveはFree
+  プランで利用不可。URLのpercent-encodingの有無やパージ要求の形式は反映可否に影響しなかった。
 
 ## ABR配信元の地域制限と実行環境
 
