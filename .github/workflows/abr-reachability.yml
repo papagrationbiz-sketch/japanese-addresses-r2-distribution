@@ -33,15 +33,15 @@ jobs:
             local label="$1" url="$2" agent="$3"
             local status
             status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -A "$agent" "$url" || echo 000)"
-            echo "$label [$agent]: HTTP $status"
+            # 人間向けの行はstderrへ。stdoutはコマンド置換で拾う status だけにする。
+            echo "$label [$agent]: HTTP $status" >&2
             echo "$status"
           }
           registry='https://dataset.address-br.digital.go.jp/api/search/v1/collections/all/items?limit=1'
           cdn='https://data.address-br.digital.go.jp/mt_town/mt_town_all.csv.zip'
-          registry_status="$(probe registry "$registry" 'curl/8.7.1' | tail -n 1)"
-          probe registry "$registry" 'curl/8.7.1 (default-ua-comparison)' >/dev/null
-          cdn_status="$(probe cdn "$cdn" 'curl/8.7.1' | tail -n 1)"
-          cdn_status_other="$(probe cdn "$cdn" 'Mozilla/5.0 (ua-comparison)' | tail -n 1)"
+          registry_status="$(probe registry "$registry" 'curl/8.7.1')"
+          cdn_status="$(probe cdn "$cdn" 'curl/8.7.1')"
+          cdn_status_other="$(probe cdn "$cdn" 'Mozilla/5.0 (ua-comparison)')"
           {
             echo "### ABR reachability from \`${{ inputs.runner }}\`"
             echo
