@@ -44,18 +44,24 @@ buildのsmokeまたは公開検証が失敗した場合、旧manifestを復元�
 
 Custom Domain、DNS、Cache Rule、CORS、Secrets、全国uploadは外部状態を変更するため、対象domain、公開範囲、費用影響、rollbackを確認してから実行する。
 
-GitHub Environment variables:
-
-- `R2_BUCKET`: R2 bucket名
-- `PUBLIC_BASE_URL`: activate時必須の公開R2 Custom Domain base URL（legacy Data Workerを使う場合はそのURL）
-
-GitHub Secrets（値はworkflowへ直書きしない）:
+GitHub Secrets（値はworkflowへ直書きしない）。Environment variableは使わない:
 
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
-- `R2_ENDPOINT`: S3互換R2 endpoint（`https://host`形式）。endpoint hostはaccount識別子を含むため、variableではなくSecretにする。Actionsは各stepの`env:`ブロックを平文で描画するので、Secretにすることでログ上は自動的にマスクされる。
+- `R2_ENDPOINT`: S3互換R2 endpoint（`https://host`形式）
+- `R2_BUCKET`: R2 bucket名
+- `PUBLIC_BASE_URL`: activate時必須の公開R2 Custom Domain base URL（legacy Data Workerを使う場合はそのURL）
 
-`R2_BUCKET`、`R2_ENDPOINT`、`PUBLIC_BASE_URL`はjob単位の`env:`へ置かない。R2へ実際にアクセスするstepと入力検証step、smoke testのstepにだけstep単位で渡す。これにより、生成stepなどR2と無関係なstepのログへ本番識別子が描画されない。
+Actionsは各stepの`env:`ブロックを平文で描画する。公開リポジトリではrun logを誰でも読めるため、
+本番識別子はすべてSecretにしてマスクさせる。
+
+- `R2_ENDPOINT`のhostはaccount識別子を含む。
+- `R2_BUCKET`は外部へ公開する必要がない。命名規則と攻撃対象の特定材料になるため出さない。
+- `PUBLIC_BASE_URL`はDNSと証明書透明性ログに載るため秘匿はできないが、公開リポジトリのrun log
+  へ本番配信先を明示する必要はない。Secretにしてリポジトリとドメインの紐付けを出さない。
+
+これらをjob単位の`env:`へ置かない。R2へ実際にアクセスするstepと入力検証step、smoke testのstepに
+だけstep単位で渡す。これにより、生成stepなどR2と無関係なstepへは渡らない。
 
 R2のendpoint、bucket、公開URL、認証値はこのリポジトリへ書かない。R2 access keyはmanifest read/write、対象prefix upload、検証済みretired prefix deleteだけの最小権限にする。workflow inputのversion/refは正規表現で検証し、AWS/Git/curlにはquote済み文字列で渡す。upstream clone、生成、validatorのstepにはR2 Secretsを渡さない。
 
