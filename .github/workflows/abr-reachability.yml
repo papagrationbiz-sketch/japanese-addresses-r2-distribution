@@ -1,0 +1,58 @@
+name: Check ABR source reachability
+
+# ABRの公式配信は日本国外からのアクセスを拒否する。GitHub-hosted runnerは日本国外に
+# 配置されるため、生成workflowはupstreamの最初のダウンロードで失敗する。この診断は
+# 実行環境からどこまで到達できるかだけを確認する。秘密情報もEnvironmentも使わない。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label to diagnose
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Report runner egress country
+        run: |
+          country="$(curl -sS --max-time 20 https://ipinfo.io/country || echo unknown)"
+          echo "egress country: $country"
+          echo "EGRESS_COUNTRY=$country" >> "$GITHUB_ENV"
+      - name: Probe the ABR registry API and distribution CDN
+        run: |
+          # upstreamと同じUser-Agentで叩く。UAが原因かどうかを切り分けるため、
+          # 既定のcurl UAでも同じ確認を行う。
+          probe() {
+            local label="$1" url="$2" agent="$3"
+            local status
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 -A "$agent" "$url" || echo 000)"
+            echo "$label [$agent]: HTTP $status"
+            echo "$status"
+          }
+          registry='https://dataset.address-br.digital.go.jp/api/search/v1/collections/all/items?limit=1'
+          cdn='https://data.address-br.digital.go.jp/mt_town/mt_town_all.csv.zip'
+          registry_status="$(probe registry "$registry" 'curl/8.7.1' | tail -n 1)"
+          probe registry "$registry" 'curl/8.7.1 (default-ua-comparison)' >/dev/null
+          cdn_status="$(probe cdn "$cdn" 'curl/8.7.1' | tail -n 1)"
+          cdn_status_other="$(probe cdn "$cdn" 'Mozilla/5.0 (ua-comparison)' | tail -n 1)"
+          {
+            echo "### ABR reachability from \`${{ inputs.runner }}\`"
+            echo
+            echo "- egress country: \`$EGRESS_COUNTRY\`"
+            echo "- registry API: \`$registry_status\`"
+            echo "- distribution CDN: \`$cdn_status\` (alternate User-Agent: \`$cdn_status_other\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$cdn_status" = 200 ]; then
+            echo 'This runner can reach the ABR distribution CDN.'
+          else
+            echo "This runner cannot download ABR data (CDN returned $cdn_status)." >&2
+            echo 'Generation must run from a Japan-based runner or be published from a verified local generation.' >&2
+            exit 1
+          fi
