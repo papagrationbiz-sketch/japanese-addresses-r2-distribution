@@ -7,3 +7,4 @@ dist/
 data/
 generated/
 fixtures/real/
+.claude/settings.local.json
